@@ -1,12 +1,10 @@
 "use client";
 
-import React, { useState } from "react";
+import React, { useState, useMemo } from "react";
 
-// apunta a Render; en local puedes sobreescribir con .env.local
-const API =
-  process.env.NEXT_PUBLIC_API_URL || "https://wialon-backend.onrender.com";
+const API = process.env.NEXT_PUBLIC_API_URL || "http://127.0.0.1:8000";
 
-/* 1) Lista de geocercas válidas que tú pasaste */
+/* --- Geocercas válidas (las que tú pasaste) --- */
 const BASE_GEOFENCES = [
   "ACA01","ACA02","AGP01","AGU01","AGU02","AGU03","AGU05","AGU06","AGU07","AGU08",
   "AGU09","AGU10","AGU11","APZ01","ATO01","BJX01","BJX02","BJX03","BJX04","CAN01",
@@ -28,30 +26,17 @@ const BASE_GEOFENCES = [
   "SLW02","STT01","SZT01","TAM01","TAM02","TAP01","TAP02","TCN01","TEC01","TGZ01",
   "TIJ01","TIJ02","TIJ03","TIJ04","TLC01","TLC02","TLC03","TLC04","TPQ01","TPT01",
   "TRC01","TUX01","TXA01","TXT01","UAC01","UPN01","VER01","VER02","VER03","VSA01",
-  "VSA02","ZCL01","ZLO01","ZMA01","ZMA02","ZMM01","ZMM02","ZPL01","ZPL02",
+  "VSA02","ZCL01","ZLO01","ZMA01","ZMA02","ZMM01","ZMM02","ZPL01","ZPL02"
 ];
 
-// permitimos también “ext” y “ext.”
 const GEOCERCAS_PERMITIDAS = new Set<string>([
   ...BASE_GEOFENCES,
   ...BASE_GEOFENCES.map((n) => `${n} ext`),
-  ...BASE_GEOFENCES.map((n) => `${n} ext.`),
+  ...BASE_GEOFENCES.map((n) => `${n} ext.`), // por si vienen con punto
 ]);
 
-type Unit = {
-  id: number;
-  name: string;
-  lat?: number;
-  lon?: number;
-  t?: number;
-};
-
-type Geofence = {
-  id: number;
-  name: string;
-  categoria?: string | null;
-};
-
+type Unit = { id: number; name: string; lat?: number; lon?: number; t?: number };
+type Geofence = { id: number; name: string; categoria?: string | null };
 type UnitRow = {
   id: number;
   name: string;
@@ -78,50 +63,21 @@ export default function PageUnidadesGeocercas() {
   const [loading, setLoading] = useState(false);
   const [hasSearched, setHasSearched] = useState(false);
 
-  // -------- helpers de fetch contra Render --------
-  async function fetchUnitsFromBackend(): Promise<Unit[]> {
-    const r = await fetch(`${API}/wialon/units`, { cache: "no-store" });
-    const j = await r.json();
-    const items = (j.units || []) as any[];
-    return items.map((u) => ({
-      id: u.id,
-      name: u.name || u.nm,
-      lat: u.lat ?? u.pos?.y,
-      lon: u.lon ?? u.pos?.x,
-      t: u.t ?? u.pos?.t,
-    }));
+  // 1) pedir snapshot + cruce
+  async function fetchSnapshotAndCross() {
+    // si sabes que es siempre ese recurso, déjalo fijo
+    const snapResp = await fetch(`${API}/wialon/snapshot?resource_id=18891825`);
+    const snap = await snapResp.json();
+
+    const crossResp = await fetch(`${API}/wialon/units/in-geofences/local`);
+    const crossJson = await crossResp.json();
+
+    return {
+      snapshot: snap,
+      cross: crossJson.result || {},
+    };
   }
 
-  async function fetchResources(): Promise<{ id: number; name: string }[]> {
-    const r = await fetch(`${API}/wialon/resources`, { cache: "no-store" });
-    const j = await r.json();
-    return (j.resources || []) as { id: number; name: string }[];
-  }
-
-  async function fetchGeofencesOf(resourceId: number): Promise<Geofence[]> {
-    const r = await fetch(`${API}/wialon/resources/${resourceId}/geofences`, {
-      cache: "no-store",
-    });
-    const j = await r.json();
-    const arr = (j.geofences || []) as any[];
-    return arr.map((g) => ({
-      id: Number(g.id),
-      name: String(g.name || g.n || ""),
-      categoria: g.categoria || null,
-    }));
-  }
-
-  async function fetchCrossLocal(): Promise<any> {
-  const r = await fetch(
-    `${API}/wialon/units/in-geofences/local?resource_id=18891825&max_units=500`,
-    { cache: "no-store" }
-  );
-  const j = await r.json();
-  return j.result || {};
-}
-
-
-  // -------- cuando el usuario da “Buscar” --------
   const handleSearch = async () => {
     const unitNames = unitInput
       .split(/[\n,]+/)
@@ -132,30 +88,38 @@ export default function PageUnidadesGeocercas() {
 
     setLoading(true);
     try {
-      // 1) Traemos unidades
-      const [units, resources, cross] = await Promise.all([
-        fetchUnitsFromBackend(),
-        fetchResources(),
-        fetchCrossLocal(),
-      ]);
+      const { snapshot, cross } = await fetchSnapshotAndCross();
 
-      // 2) Traemos TODAS las geocercas de TODOS los recursos que haya
+      // -- armar diccionario de unidades por nombre
+      const units: Unit[] = (snapshot.units || []).map((u: any) => ({
+        id: u.id,
+        name: u.name || u.nm,
+        lat: u.lat ?? u.y ?? u.pos?.y,
+        lon: u.lon ?? u.x ?? u.pos?.x,
+        t: u.t ?? u.pos?.t,
+      }));
+
+      const unitByName = new Map<string, Unit>();
+      units.forEach((u) => {
+        unitByName.set(u.name.toLowerCase(), u);
+      });
+
+      // -- armar diccionario de geocercas por id
       const geofenceById = new Map<number, Geofence>();
-      for (const res of resources) {
-        try {
-          const geos = await fetchGeofencesOf(res.id);
-          geos.forEach((g) => geofenceById.set(g.id, g));
-        } catch (e) {
-          // si algún recurso falla no rompemos todo
-          console.warn("error trayendo geocercas del recurso", res.id, e);
-        }
+      const geosByRes = snapshot.geofences_by_resource || {};
+      for (const resId of Object.keys(geosByRes)) {
+        const arr = geosByRes[resId] as any[];
+        (arr || []).forEach((g) => {
+          const name = String(g.name || g.n || "");
+          geofenceById.set(Number(g.id), {
+            id: Number(g.id),
+            name,
+            categoria: g.categoria || null,
+          });
+        });
       }
 
-      // 3) armamos índice de unidades por nombre (lowercase)
-      const unitByName = new Map<string, Unit>();
-      units.forEach((u) => unitByName.set((u.name || "").toLowerCase(), u));
-
-      // 4) armamos diccionario unitId -> [geofenceIds] desde el cruce
+      // -- armar diccionario unitId -> [geofenceIds] usando el cruce
       const zonesByUnitId: Record<number, number[]> = {};
       for (const resId of Object.keys(cross)) {
         const byUnit = cross[resId] || {};
@@ -172,31 +136,30 @@ export default function PageUnidadesGeocercas() {
         }
       }
 
-      // 5) construimos las filas en el MISMO orden que el usuario escribió
+      // -- ahora se construyen las filas respetando el orden que el usuario pidió
       const finalRows: UnitRow[] = unitNames.map((name, idx) => {
         const found = unitByName.get(name.toLowerCase());
         if (!found) {
-          // no existe en wialon → fila vacía pero con el nombre
+          // unidad no existe en wialon → fila en blanco pero con nombre
           return {
             id: 100000 + idx,
             name,
             zones: [],
           };
         }
-
-        const geoIds = zonesByUnitId[found.id] || [];
-        const zones = geoIds
+        // geocercas desde el cruce
+        const geofenceIds = zonesByUnitId[found.id] || [];
+        const zones = geofenceIds
           .map((id) => geofenceById.get(id))
           .filter(Boolean)
           .filter((g) => {
             const raw = g!.name.trim();
-            const sinPunto = raw.replace(/\.$/, ""); // quita punto final
-            // aceptamos varias formas
+            const clean = raw.replace(/\.$/, "");
             return (
-              GEOCERCAS_PERMITIDAS.has(raw) ||
-              GEOCERCAS_PERMITIDAS.has(sinPunto) ||
-              GEOCERCAS_PERMITIDAS.has(`${sinPunto} ext`) ||
-              GEOCERCAS_PERMITIDAS.has(`${sinPunto} ext.`)
+              GEOCERCAS_PERMITIDAS.has(clean) ||
+              GEOCERCAS_PERMITIDAS.has(`${clean} ext`) ||
+              GEOCERCAS_PERMITIDAS.has(clean.replace(/ ext\.?$/, "")) ||
+              GEOCERCAS_PERMITIDAS.has(raw)
             );
           }) as Geofence[];
 
@@ -217,7 +180,7 @@ export default function PageUnidadesGeocercas() {
     }
   };
 
-  // botón para copiar sólo la columna “Sucursal”
+  // copiar solo la columna Sucursal
   const handleCopySoloSucursal = async () => {
     const txt = rows.map((r) => (r.zones.length ? "S" : "")).join("\n");
     try {
@@ -232,11 +195,9 @@ export default function PageUnidadesGeocercas() {
   return (
     <div className="min-h-screen bg-gray-50">
       <div className="mx-auto max-w-7xl px-4 py-6">
-        <h1 className="text-3xl font-bold mb-4 text-gray-900">
-          Unidades y Geocercas (Render)
-        </h1>
+        <h1 className="text-3xl font-bold mb-4 text-gray-900">Unidades y Geocercas (rápido)</h1>
 
-        {/* entrada */}
+        {/* entrada de unidades */}
         <label className="block text-sm font-medium text-gray-700 mb-1">
           Ingresa las unidades (una por línea o separadas por coma)
         </label>
@@ -245,7 +206,7 @@ export default function PageUnidadesGeocercas() {
           onChange={(e) => setUnitInput(e.target.value)}
           rows={3}
           className="w-full rounded-md border px-3 py-2 text-sm bg-white"
-          placeholder={`Ejemplo:\nITM M004090\nITM M004091\nCAMION 03`}
+          placeholder={`Ejemplo:\nPAQ-001\nPAQ-002\nCAMION-03`}
         />
 
         <div className="mt-2 flex gap-2">
@@ -268,9 +229,9 @@ export default function PageUnidadesGeocercas() {
         </div>
 
         {!hasSearched ? (
-            <div className="mt-6 rounded-lg border border-dashed bg-white p-6 text-center text-gray-500">
-              Ingresa primero las unidades y presiona “Buscar”.
-            </div>
+          <div className="mt-6 rounded-lg border border-dashed bg-white p-6 text-center text-gray-500">
+            Ingresa primero las unidades y presiona “Buscar”.
+          </div>
         ) : (
           <div className="mt-6 overflow-hidden rounded-xl border bg-white shadow-sm">
             <table className="min-w-full divide-y divide-gray-200">
@@ -285,35 +246,25 @@ export default function PageUnidadesGeocercas() {
               </thead>
               <tbody className="divide-y divide-gray-100">
                 {rows.map((u) => (
-                  <tr key={u.id}>
-                    <td className="px-4 py-3 font-medium text-gray-900">
-                      {u.name}
-                    </td>
-                    <td className="px-4 py-3 text-sm text-gray-700">
-                      {u.zones.length ? "S" : ""}
-                    </td>
-                    <td className="px-4 py-3 text-sm text-gray-700">
-                      {fmtDT(u.t)}
-                    </td>
-                    <td className="px-4 py-3 text-sm text-gray-700">
-                      {u.lat != null && u.lon != null
-                        ? `${u.lat.toFixed(6)},${u.lon.toFixed(6)}`
-                        : "—"}
-                    </td>
-                    <td className="px-4 py-3">
-                      {u.zones.length ? (
-                        <div className="flex flex-wrap gap-2">
-                          {u.zones.map((z) => (
-                            <Badge key={`${u.id}-${z.id}`} label={z.name} />
-                          ))}
-                        </div>
-                      ) : (
-                        <span className="text-sm text-gray-400">
-                          Sin geocercas
-                        </span>
-                      )}
-                    </td>
-                  </tr>
+                    <tr key={u.id}>
+                      <td className="px-4 py-3 font-medium text-gray-900">{u.name}</td>
+                      <td className="px-4 py-3 text-sm text-gray-700">{u.zones.length ? "S" : ""}</td>
+                      <td className="px-4 py-3 text-sm text-gray-700">{fmtDT(u.t)}</td>
+                      <td className="px-4 py-3 text-sm text-gray-700">
+                        {u.lat != null && u.lon != null ? `${u.lat.toFixed(6)},${u.lon.toFixed(6)}` : "—"}
+                      </td>
+                      <td className="px-4 py-3">
+                        {u.zones.length ? (
+                          <div className="flex flex-wrap gap-2">
+                            {u.zones.map((z) => (
+                              <Badge key={`${u.id}-${z.id}`} label={z.name} />
+                            ))}
+                          </div>
+                        ) : (
+                          <span className="text-sm text-gray-400">Sin geocercas</span>
+                        )}
+                      </td>
+                    </tr>
                 ))}
               </tbody>
             </table>
